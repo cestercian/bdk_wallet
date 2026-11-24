@@ -106,7 +106,7 @@ use bitcoin::{key::TapTweak, key::XOnlyPublicKey, secp256k1};
 
 use miniscript::descriptor::{
     Descriptor, DescriptorMultiXKey, DescriptorPublicKey, DescriptorSecretKey, DescriptorXKey,
-    InnerXKey, KeyMap, SinglePriv, SinglePubKey,
+    InnerXKey, KeyMap, SinglePriv, SinglePubKey, Wildcard,
 };
 use miniscript::{SigType, ToPublicKey};
 
@@ -337,7 +337,7 @@ impl InputSigner for SignerWrapper<DescriptorXKey<Xpriv>> {
         secp: &SecpCtx,
     ) -> Result<(), SignerError> {
         if input_index >= psbt.inputs.len() {
-            return Err(IndexOutOfBoundsError::new(input_index, psbt.inputs.len()))?;
+            Err(IndexOutOfBoundsError::new(input_index, psbt.inputs.len()))?;
         }
 
         if psbt.inputs[input_index].final_script_sig.is_some()
@@ -356,7 +356,20 @@ impl InputSigner for SignerWrapper<DescriptorXKey<Xpriv>> {
             .map(|(pk, keysource)| (SinglePubKey::FullKey(PublicKey::new(*pk)), keysource))
             .chain(tap_key_origins)
             .find_map(|(pk, keysource)| {
-                if self.matches(keysource, secp).is_some() {
+                self.matches(keysource, secp)?;
+                // `matches()` ignores the wildcard's final path step, so verify its
+                // hardness against `self.wildcard` separately.
+                let last_step = keysource.1.as_ref().last();
+                let wildcard_step_is_valid = match self.wildcard {
+                    Wildcard::None => true,
+                    Wildcard::Unhardened => {
+                        matches!(last_step, Some(step) if !step.is_hardened())
+                    }
+                    Wildcard::Hardened => {
+                        matches!(last_step, Some(step) if step.is_hardened())
+                    }
+                };
+                if wildcard_step_is_valid {
                     Some((pk, keysource.1.clone()))
                 } else {
                     None
@@ -462,10 +475,10 @@ impl InputSigner for SignerWrapper<PrivateKey> {
         secp: &SecpCtx,
     ) -> Result<(), SignerError> {
         if input_index >= psbt.inputs.len() {
-            return Err(IndexOutOfBoundsError::new(input_index, psbt.inputs.len()))?;
+            Err(IndexOutOfBoundsError::new(input_index, psbt.inputs.len()))?;
         }
         if input_index >= psbt.unsigned_tx.input.len() {
-            return Err(IndexOutOfBoundsError::new(
+            Err(IndexOutOfBoundsError::new(
                 input_index,
                 psbt.unsigned_tx.input.len(),
             ))?;
@@ -485,19 +498,21 @@ impl InputSigner for SignerWrapper<PrivateKey> {
                 .as_ref()
                 .is_some_and(|witness| witness != prevout)
             {
+                // Ideally InvalidWitnessUtxo; reuse this error for API compatibility.
                 return Err(SignerError::InvalidNonWitnessUtxo);
             }
-        } else if !sign_options.trust_witness_utxo && input.witness_utxo.is_some() {
-            let all_inputs_p2tr =
-                psbt.inputs
-                    .iter()
-                    .zip(psbt.unsigned_tx.input.iter())
-                    .all(|(inp, txin)| {
-                        validated_non_witness_prevout(inp, txin.previous_output)
-                            .or(inp.witness_utxo.as_ref())
-                            .is_some_and(|txout| txout.script_pubkey.is_p2tr())
-                    });
-            if !all_inputs_p2tr {
+        }
+        if !matches!(self.ctx, SignerContext::Tap { .. }) {
+            if psbt
+                .spend_utxo(input_index)
+                .is_ok_and(|prevout| prevout.script_pubkey.is_p2tr())
+            {
+                return Ok(());
+            }
+            if !sign_options.trust_witness_utxo
+                && input.witness_utxo.is_some()
+                && input.non_witness_utxo.is_none()
+            {
                 return Err(SignerError::MissingNonWitnessUtxo);
             }
         }
@@ -834,12 +849,9 @@ pub struct SignOptions {
     /// For more details see: <https://blog.trezor.io/details-of-firmware-updates-for-trezor-one-version-1-9-1-and-trezor-model-t-version-2-3-1-1eba8f60f2dd>
     pub trust_witness_utxo: bool,
 
-    /// Whether the wallet should assume a specific height has been reached when trying to finalize
-    /// a transaction
-    ///
-    /// The wallet will only "use" a timelock to satisfy the spending policy of an input if the
-    /// timelock height has already been reached. This option allows overriding the "current
-    /// height" to let the wallet use timelocks in the future to spend a coin.
+    /// Unused: timelocks are checked against the PSBT's `nLockTime` and `nSequence`, so this has
+    /// no effect.
+    #[deprecated(note = "timelocks are now checked against the PSBT's nLockTime and nSequence")]
     pub assume_height: Option<u32>,
 
     /// Whether the signer should use the `sighash_type` set in the PSBT when signing, no matter
@@ -887,6 +899,7 @@ pub enum TapLeavesOptions {
 }
 
 impl Default for SignOptions {
+    #[allow(deprecated)]
     fn default() -> Self {
         SignOptions {
             trust_witness_utxo: false,
@@ -1191,6 +1204,156 @@ mod signers_container_tests {
     const TPRV1_STR: &str = "tprv8ZgxMBicQKsPdpkqS7Eair4YxjcuuvDPNYmKX3sCniCf16tHEVrjjiSXEkFRnUH77yXc6ZcwHHcLNfjdi5qUvw3VDfgYiH5mNsj5izuiu2N";
 
     const PATH: &str = "m/44'/1'/0'/0";
+
+    fn signed_psbt_with_wildcard(taproot: bool, desc_suffix: &str, psbt_path: &str) -> Psbt {
+        use bitcoin::{
+            Amount, OutPoint, PrivateKey, ScriptBuf, Sequence, TxIn, TxOut, Witness, absolute,
+            transaction,
+        };
+
+        let secp = Secp256k1::new();
+        let script = if taproot { "tr" } else { "wpkh" };
+        let (wallet_desc, keymap) = format!("{script}({TPRV0_STR}/{desc_suffix})")
+            .as_str()
+            .into_wallet_descriptor(&secp, NetworkKind::Test)
+            .unwrap();
+        let signers = SignersContainer::build(keymap, &wallet_desc, &secp);
+
+        let tprv = bip32::Xpriv::from_str(TPRV0_STR).unwrap();
+        let full_path = bip32::DerivationPath::from_str(psbt_path).unwrap();
+        let child = tprv.derive_priv(&secp, &full_path).unwrap();
+        let child_pub = PrivateKey::new(child.private_key, NetworkKind::Test).public_key(&secp);
+        let child_xonly = XOnlyPublicKey::from(child_pub.inner);
+        let child_spk = if taproot {
+            ScriptBuf::new_p2tr(&secp, child_xonly, None)
+        } else {
+            Descriptor::<bitcoin::PublicKey>::from_str(&format!("wpkh({child_pub})"))
+                .unwrap()
+                .script_pubkey()
+        };
+
+        let prev_tx = bitcoin::Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::default(),
+                sequence: Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: child_spk,
+            }],
+        };
+        let unsigned_tx = bitcoin::Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(prev_tx.compute_txid(), 0),
+                script_sig: ScriptBuf::default(),
+                sequence: Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(90_000),
+                script_pubkey: ScriptBuf::default(),
+            }],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(unsigned_tx).unwrap();
+        psbt.inputs[0].witness_utxo = Some(prev_tx.output[0].clone());
+        psbt.inputs[0].non_witness_utxo = Some(prev_tx);
+
+        let keysource = (tprv.fingerprint(&secp), full_path);
+        if taproot {
+            psbt.inputs[0].tap_internal_key = Some(child_xonly);
+            psbt.inputs[0]
+                .tap_key_origins
+                .insert(child_xonly, (vec![], keysource));
+        } else {
+            psbt.inputs[0]
+                .bip32_derivation
+                .insert(child_pub.inner, keysource);
+        }
+
+        signers.signers()[0]
+            .sign_transaction(&mut psbt, &SignOptions::default(), &secp)
+            .unwrap();
+
+        psbt
+    }
+
+    fn sign_with_wildcard(desc_suffix: &str, psbt_path: &str) -> bool {
+        !signed_psbt_with_wildcard(false, desc_suffix, psbt_path).inputs[0]
+            .partial_sigs
+            .is_empty()
+    }
+
+    fn sign_taproot_with_wildcard(desc_suffix: &str, psbt_path: &str) -> bool {
+        signed_psbt_with_wildcard(true, desc_suffix, psbt_path).inputs[0]
+            .tap_key_sig
+            .is_some()
+    }
+
+    #[test]
+    fn sign_input_accepts_unhardened_wildcard_with_unhardened_child() {
+        assert!(sign_with_wildcard("0/*", "m/0/1"));
+    }
+
+    #[test]
+    fn sign_input_rejects_unhardened_wildcard_with_hardened_child() {
+        assert!(!sign_with_wildcard("0/*", "m/0/1h"));
+    }
+
+    #[test]
+    fn sign_input_accepts_hardened_wildcard_with_hardened_child() {
+        assert!(sign_with_wildcard("0/*h", "m/0/1h"));
+    }
+
+    #[test]
+    fn sign_input_rejects_hardened_wildcard_with_unhardened_child() {
+        assert!(!sign_with_wildcard("0/*h", "m/0/1"));
+    }
+
+    #[test]
+    fn sign_input_accepts_fixed_path_without_wildcard() {
+        assert!(sign_with_wildcard("0/1", "m/0/1"));
+    }
+
+    #[test]
+    fn sign_input_accepts_hardened_fixed_path_without_wildcard() {
+        assert!(sign_with_wildcard("0/1h", "m/0/1h"));
+    }
+
+    #[test]
+    fn sign_input_rejects_empty_path_for_wildcard() {
+        assert!(!sign_with_wildcard("*", "m"));
+    }
+
+    #[test]
+    fn sign_input_tap_key_origins_accepts_unhardened_wildcard_with_unhardened_child() {
+        assert!(sign_taproot_with_wildcard("0/*", "m/0/1"));
+    }
+
+    #[test]
+    fn sign_input_tap_key_origins_rejects_unhardened_wildcard_with_hardened_child() {
+        assert!(!sign_taproot_with_wildcard("0/*", "m/0/1h"));
+    }
+
+    #[test]
+    fn sign_input_tap_key_origins_accepts_hardened_wildcard_with_hardened_child() {
+        assert!(sign_taproot_with_wildcard("0/*h", "m/0/1h"));
+    }
+
+    #[test]
+    fn sign_input_tap_key_origins_rejects_hardened_wildcard_with_unhardened_child() {
+        assert!(!sign_taproot_with_wildcard("0/*h", "m/0/1"));
+    }
+
+    #[test]
+    fn sign_input_tap_key_origins_rejects_empty_path_for_wildcard() {
+        assert!(!sign_taproot_with_wildcard("*", "m"));
+    }
 
     fn setup_keys<Ctx: ScriptContext>(
         tprv: &str,

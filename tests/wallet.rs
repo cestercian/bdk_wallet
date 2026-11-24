@@ -24,7 +24,7 @@ use bitcoin::sighash::{EcdsaSighashType, TapSighashType};
 use bitcoin::taproot::TapNodeHash;
 use bitcoin::{
     Address, Amount, BlockHash, FeeRate, Network, OutPoint, ScriptBuf, Sequence, SignedAmount,
-    Transaction, TxIn, TxOut, Txid, absolute, transaction,
+    Transaction, TxIn, TxOut, Txid, WPubkeyHash, Weight, absolute, psbt, transaction,
 };
 use miniscript::descriptor::KeyMapWrapper;
 use rand::SeedableRng;
@@ -3696,4 +3696,393 @@ fn test_create_and_spend_from_truc_tx() -> anyhow::Result<()> {
     );
 
     Ok(())
+}
+/// A PSBT whose `nLockTime` does not satisfy the descriptor's `after` condition must not be
+/// finalized, even if the tip is past the lock height.
+#[test]
+fn test_finalize_psbt_requires_locktime_for_cltv() {
+    let (mut wallet, _) = get_funded_wallet_single(get_test_single_sig_cltv());
+    let signer = KeyMapWrapper::from(keymap_from_descriptor(&wallet, get_test_single_sig_cltv()));
+
+    let block = BlockId {
+        height: 100_000,
+        hash: BlockHash::all_zeros(),
+    };
+    insert_checkpoint(&mut wallet, block);
+
+    let addr = wallet.next_unused_address(KeychainKind::External);
+    let mut builder = wallet.build_tx();
+    builder.add_recipient(addr.script_pubkey(), Amount::from_sat(25_000));
+    let mut psbt = builder.finish().unwrap();
+
+    assert_eq!(psbt.unsigned_tx.lock_time.to_consensus_u32(), 100_000);
+
+    let mut valid_psbt = psbt.clone();
+    valid_psbt.sign(&signer, wallet.secp_ctx()).unwrap();
+    let finalized = wallet
+        .finalize_psbt(&mut valid_psbt, SignOptions::default())
+        .unwrap();
+
+    assert!(finalized);
+
+    psbt.unsigned_tx.lock_time = absolute::LockTime::ZERO;
+
+    psbt.sign(&signer, wallet.secp_ctx()).unwrap();
+    let finalized = wallet
+        .finalize_psbt(&mut psbt, SignOptions::default())
+        .unwrap();
+
+    assert!(!finalized);
+}
+
+/// A PSBT whose `nSequence` does not satisfy the descriptor's `older` condition must not be
+/// finalized, even if the input has enough confirmations.
+#[test]
+fn test_finalize_psbt_requires_sequence_for_csv() {
+    let (mut wallet, _) = get_funded_wallet_single(get_test_single_sig_csv());
+    let signer = KeyMapWrapper::from(keymap_from_descriptor(&wallet, get_test_single_sig_csv()));
+
+    let block = BlockId {
+        height: 2_006,
+        hash: BlockHash::all_zeros(),
+    };
+    insert_checkpoint(&mut wallet, block);
+
+    let addr = wallet.next_unused_address(KeychainKind::External);
+    let mut builder = wallet.build_tx();
+    builder.add_recipient(addr.script_pubkey(), Amount::from_sat(25_000));
+    let mut psbt = builder.finish().unwrap();
+
+    assert_eq!(psbt.unsigned_tx.input[0].sequence, Sequence(6));
+
+    let mut valid_psbt = psbt.clone();
+    valid_psbt.sign(&signer, wallet.secp_ctx()).unwrap();
+    let finalized = wallet
+        .finalize_psbt(&mut valid_psbt, SignOptions::default())
+        .unwrap();
+
+    assert!(finalized);
+
+    psbt.unsigned_tx.input[0].sequence = Sequence::MAX;
+
+    psbt.sign(&signer, wallet.secp_ctx()).unwrap();
+    let finalized = wallet
+        .finalize_psbt(&mut psbt, SignOptions::default())
+        .unwrap();
+
+    assert!(!finalized);
+}
+
+/// Finalizing a spend of an unconfirmed UTXO must not panic when the descriptor has an unused
+/// `older` branch.
+#[test]
+fn test_finalize_psbt_unconfirmed_tx_with_older_branch() {
+    // `wsh(or_d(pk(A),and_v(v:pk(B),older(144))))`, spent through the `pk(A)` branch.
+    let mut wallet = Wallet::create_single(get_test_a_or_b_plus_csv())
+        .network(Network::Regtest)
+        .create_wallet_no_persist()
+        .unwrap();
+    let addr = wallet.next_unused_address(KeychainKind::External);
+
+    let funding_tx = Transaction {
+        output: vec![TxOut {
+            value: Amount::from_sat(50_000),
+            script_pubkey: addr.script_pubkey(),
+        }],
+        ..new_tx(0)
+    };
+    insert_tx(&mut wallet, funding_tx);
+
+    let policy = wallet
+        .public_descriptor(KeychainKind::External)
+        .extract_policy(
+            &SignersContainer::default(),
+            BuildSatisfaction::None,
+            wallet.secp_ctx(),
+        )
+        .unwrap()
+        .unwrap();
+    let path = [(policy.id.clone(), vec![0])].into_iter().collect();
+    let condition = policy.get_condition(&path).unwrap();
+
+    let mut builder = wallet.build_tx();
+    builder
+        .add_recipient(addr.script_pubkey(), Amount::from_sat(10_000))
+        .set_condition(condition);
+    let mut psbt = builder.finish().unwrap();
+
+    let signer = KeyMapWrapper::from(keymap_from_descriptor(&wallet, get_test_a_or_b_plus_csv()));
+    psbt.sign(&signer, wallet.secp_ctx()).unwrap();
+    let finalized = wallet
+        .finalize_psbt(&mut psbt, SignOptions::default())
+        .unwrap();
+
+    assert!(finalized);
+}
+
+/// `extract_policy` with `PsbtTimelocks` treats `after` and `older` as satisfied from their lock
+/// height on.
+#[test]
+fn test_extract_policy_timelock_boundaries() {
+    use bdk_wallet::descriptor::policy::Satisfaction;
+
+    // Satisfied items of `and_v(v:pk(..),<timelock>)`, where the timelock is item 1.
+    let satisfied_items = |descriptor: &str, current_height: u32| {
+        let (mut wallet, _) = get_funded_wallet_single(descriptor);
+        let addr = wallet.next_unused_address(KeychainKind::External);
+        let mut builder = wallet.build_tx();
+        builder.add_recipient(addr.script_pubkey(), Amount::from_sat(25_000));
+        let psbt = builder.finish().unwrap();
+        let build_sat = BuildSatisfaction::PsbtTimelocks {
+            psbt: &psbt,
+            current_height,
+            input_max_height: 2_000,
+        };
+        let policy = wallet
+            .public_descriptor(KeychainKind::External)
+            .extract_policy(&SignersContainer::default(), build_sat, wallet.secp_ctx())
+            .unwrap()
+            .unwrap();
+        match policy.satisfaction {
+            Satisfaction::Partial { items, .. } => items,
+            other => panic!("unexpected satisfaction {other:?}"),
+        }
+    };
+
+    assert!(satisfied_items(get_test_single_sig_csv(), 2_005).is_empty());
+    assert_eq!(satisfied_items(get_test_single_sig_csv(), 2_006), vec![1]);
+    assert!(satisfied_items(get_test_single_sig_cltv(), 99_999).is_empty());
+    assert_eq!(
+        satisfied_items(get_test_single_sig_cltv(), 100_000),
+        vec![1]
+    );
+}
+
+/// Fund `wallet` with `n` confirmed outputs of `value` in a single transaction.
+fn fund_wallet_with_n_utxos(wallet: &mut Wallet, n: u32, value: Amount) {
+    let last_index = n.saturating_sub(1);
+    let _revealed: Vec<_> = wallet
+        .reveal_addresses_to(KeychainKind::External, last_index)
+        .collect();
+
+    let outputs = (0..n)
+        .map(|i| TxOut {
+            script_pubkey: wallet
+                .peek_address(KeychainKind::External, i)
+                .script_pubkey(),
+            value,
+        })
+        .collect();
+
+    let tx = Transaction {
+        version: transaction::Version::ONE,
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![],
+        output: outputs,
+    };
+
+    let height = wallet.latest_checkpoint().height() + 1;
+    let mut hash_bytes = [0u8; 32];
+    hash_bytes[0] = 0x42;
+    hash_bytes[1] = (height % 256) as u8;
+    insert_tx_anchor(
+        wallet,
+        tx,
+        BlockId {
+            height,
+            hash: BlockHash::from_byte_array(hash_bytes),
+        },
+    );
+}
+
+#[test]
+fn test_create_tx_rejects_over_max_standard_tx_weight() {
+    // A drain of many small P2WPKH UTXOs is the reported failure mode: the unsigned
+    // transaction stays under the limit, but the estimated signed weight does not.
+    let (desc, change_desc) = get_test_wpkh_and_change_desc();
+    let mut wallet = Wallet::create(desc, change_desc)
+        .network(Network::Regtest)
+        .create_wallet_no_persist()
+        .unwrap();
+
+    // ~1,500 P2WPKH inputs ≈ 408k WU once satisfied (issue #543).
+    const N_UTXOS: u32 = 1_500;
+    fund_wallet_with_n_utxos(&mut wallet, N_UTXOS, Amount::from_sat(1_000));
+    assert_eq!(wallet.list_unspent().count(), N_UTXOS as usize);
+
+    let drain_addr = Address::from_str("bcrt1q3qtze4ys45tgdvguj66zrk4fu6hq3a3v9pfly5")
+        .unwrap()
+        .assume_checked();
+    let mut builder = wallet.build_tx();
+    builder
+        .drain_wallet()
+        .drain_to(drain_addr.script_pubkey())
+        .fee_rate(FeeRate::BROADCAST_MIN);
+
+    assert_matches!(
+        builder.finish(),
+        Err(CreateTxError::TxWeightLimitExceeded { weight, limit })
+            if weight > limit
+                && limit == Weight::from_wu(u64::from(bitcoin::policy::MAX_STANDARD_TX_WEIGHT))
+    );
+}
+
+#[test]
+fn test_create_tx_rejects_over_max_standard_tx_weight_foreign_satisfaction() {
+    // Unit-level construction: a single foreign input whose satisfaction weight
+    // alone pushes the estimated signed weight over the standardness limit.
+    let (mut wallet, _) = get_funded_wallet_wpkh();
+    let addr = wallet.next_unused_address(KeychainKind::External);
+
+    let foreign_prev_tx = Transaction {
+        version: transaction::Version::TWO,
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![],
+        output: vec![TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: ScriptBuf::new_p2wpkh(&WPubkeyHash::all_zeros()),
+        }],
+    };
+    let outpoint = OutPoint {
+        txid: foreign_prev_tx.compute_txid(),
+        vout: 0,
+    };
+    let psbt_input = psbt::Input {
+        witness_utxo: Some(foreign_prev_tx.output[0].clone()),
+        non_witness_utxo: Some(foreign_prev_tx),
+        ..Default::default()
+    };
+
+    let mut builder = wallet.build_tx();
+    builder
+        .add_recipient(addr.script_pubkey(), Amount::from_sat(25_000))
+        .only_witness_utxo()
+        .add_foreign_utxo(
+            outpoint,
+            psbt_input,
+            Weight::from_wu(u64::from(bitcoin::policy::MAX_STANDARD_TX_WEIGHT)),
+        )
+        .unwrap();
+
+    assert_matches!(
+        builder.finish(),
+        Err(CreateTxError::TxWeightLimitExceeded { weight, limit })
+            if weight > limit
+                && limit == Weight::from_wu(u64::from(bitcoin::policy::MAX_STANDARD_TX_WEIGHT))
+    );
+}
+
+#[test]
+fn test_create_tx_legacy_foreign_both_utxo_fields_at_standardness_limit() {
+    // Legacy P2PKH foreign input with both non_witness_utxo and witness_utxo. The spend is
+    // legacy; witness_utxo must not add the BIP 141 marker, flag, and per-input stack length.
+    // That misclassification estimates a 400_000 WU transaction as 400_003 WU and rejects it.
+    let limit = Weight::from_wu(u64::from(bitcoin::policy::MAX_STANDARD_TX_WEIGHT));
+
+    let probe = finish_legacy_foreign_both_utxos(Weight::from_wu(428))
+        .expect("small legacy foreign satisfaction should build");
+    let unsigned = probe.unsigned_tx.weight();
+    let satisfaction = limit
+        .checked_sub(unsigned)
+        .expect("unsigned weight is under the standardness limit");
+    // Signed legacy weight is exactly the standardness limit. Classifying this input as segwit
+    // would add marker + flag + one stack-length byte (3 WU) and reject 400_003 WU.
+    assert_eq!(unsigned.checked_add(satisfaction).unwrap(), limit);
+
+    let psbt = finish_legacy_foreign_both_utxos(satisfaction).expect(
+        "legacy spend whose signed weight is exactly MAX_STANDARD_TX_WEIGHT must be accepted",
+    );
+    assert_eq!(psbt.unsigned_tx.input.len(), 1);
+    assert!(psbt.unsigned_tx.input[0].witness.is_empty());
+    assert!(psbt.inputs[0].witness_utxo.is_some());
+    assert!(psbt.inputs[0].non_witness_utxo.is_some());
+    assert!(
+        psbt.inputs[0]
+            .witness_utxo
+            .as_ref()
+            .unwrap()
+            .script_pubkey
+            .is_p2pkh()
+    );
+    assert_eq!(psbt.unsigned_tx.weight() + satisfaction, limit);
+}
+
+/// Build a one-input drain that spends a legacy P2PKH foreign UTXO carrying both UTXO fields.
+fn finish_legacy_foreign_both_utxos(satisfaction: Weight) -> Result<bitcoin::Psbt, CreateTxError> {
+    let (mut wallet, _) = get_funded_wallet_wpkh();
+    let addr = wallet.next_unused_address(KeychainKind::External);
+
+    let prev_tx = Transaction {
+        version: transaction::Version::TWO,
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![],
+        output: vec![TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: ScriptBuf::new_p2pkh(&bitcoin::PubkeyHash::all_zeros()),
+        }],
+    };
+    let outpoint = OutPoint {
+        txid: prev_tx.compute_txid(),
+        vout: 0,
+    };
+    let psbt_input = psbt::Input {
+        witness_utxo: Some(prev_tx.output[0].clone()),
+        non_witness_utxo: Some(prev_tx),
+        ..Default::default()
+    };
+
+    let mut builder = wallet.build_tx();
+    builder
+        .add_foreign_utxo(outpoint, psbt_input, satisfaction)
+        .unwrap();
+    builder
+        .manually_selected_only()
+        .fee_absolute(Amount::from_sat(1_000))
+        .drain_wallet()
+        .drain_to(addr.script_pubkey());
+    builder.finish()
+}
+
+#[test]
+fn test_create_tx_rejects_astronomical_foreign_satisfaction_without_overflow() {
+    // A caller-supplied satisfaction near u64::MAX must not panic (debug) or wrap (release).
+    // Either failure mode used to skip TxWeightLimitExceeded.
+    let (mut wallet, _) = get_funded_wallet_wpkh();
+    let addr = wallet.next_unused_address(KeychainKind::External);
+
+    let foreign_prev_tx = Transaction {
+        version: transaction::Version::TWO,
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![],
+        output: vec![TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: ScriptBuf::new_p2wpkh(&WPubkeyHash::all_zeros()),
+        }],
+    };
+    let outpoint = OutPoint {
+        txid: foreign_prev_tx.compute_txid(),
+        vout: 0,
+    };
+    let psbt_input = psbt::Input {
+        witness_utxo: Some(foreign_prev_tx.output[0].clone()),
+        non_witness_utxo: Some(foreign_prev_tx),
+        ..Default::default()
+    };
+
+    let mut builder = wallet.build_tx();
+    builder
+        .add_foreign_utxo(outpoint, psbt_input, Weight::from_wu(u64::MAX - 200))
+        .unwrap();
+    builder
+        .manually_selected_only()
+        .fee_absolute(Amount::from_sat(1000))
+        .drain_wallet()
+        .drain_to(addr.script_pubkey());
+
+    assert_matches!(
+        builder.finish(),
+        Err(CreateTxError::TxWeightLimitExceeded { weight, limit })
+            if weight > limit
+                && limit == Weight::from_wu(u64::from(bitcoin::policy::MAX_STANDARD_TX_WEIGHT))
+    );
 }

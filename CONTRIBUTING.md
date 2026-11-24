@@ -49,7 +49,7 @@ hesitate to split it into multiple small, focused PRs.
 The Minimum Supported Rust Version is **1.85.0** (enforced by our CI).
 
 Commits should cover both the issue fixed and the solution's rationale.
-These [guidelines](https://chris.beams.io/posts/git-commit/) should be kept in mind. Commit messages follow the ["Conventional Commits 1.0.0"](https://www.conventionalcommits.org/en/v1.0.0/) to make commit histories easier to read by humans and automated tools. All commits must be [GPG signed](https://docs.github.com/en/authentication/managing-commit-signature-verification/signing-commits).
+These [guidelines](https://chris.beams.io/posts/git-commit/) should be kept in mind. Commit messages follow the ["Conventional Commits 1.0.0"](https://www.conventionalcommits.org/en/v1.0.0/) to make commit histories easier to read by humans and automated tools. release-plz uses these commit messages to generate the changelog and infer the next version, so use a meaningful type and scope and mark breaking changes with `!`. All commits must be [GPG signed](https://docs.github.com/en/authentication/managing-commit-signature-verification/signing-commits).
 
 To facilitate communication with other contributors, the project is making use
 of GitHub's "assignee" field. First check that no one is assigned and then
@@ -95,13 +95,30 @@ well as test out the patch set and opine on the technical merits of the patch.
 PR should be reviewed first on the conceptual level before focusing on code
 style or grammar fixes.
 
-To merge a PR we require all CI tests to pass, the PR has at least one approving review by a maintainer with write access, and reasonable criticisms have been addressed.
+Repository maintainers
+----------------------
+
+Like all open source projects our maintainers are busy. Please take it easy on
+them and only ping them if you get no response for a week or two. Maintainers must ensure
+that there is "rough consensus" that a PR is needed and correctly implemented.
+Maintainers are not required to review and test your PR. A maintainer may ACK and
+merge (or NACK and close) a PR based on the reviews of any competent project contributors.
+Non-trivial changes should have more than one ACK and no un-addressed NACKs from project
+contributors who have demonstrated they understand the code being changed.
+
+Minimum pull request merge requirements:
+
+- all CI tests pass.
+- at least one "accepts"/ACK from a repository maintainer (other than the author). 
+- no reasonable "rejects"/NACK from anybody who reviewed the code.
+
+See the [CODEOWNERS](.github/CODEOWNERS) file for a current list of the project maintainers.
 
 Coding Conventions
 ------------------
 
 This codebase uses spaces, not tabs.
-Use `cargo +nightly fmt` to format code before committing.
+Use `just fmt` (which runs `cargo fmt` with the nightly toolchain pinned in the `justfile`) to format code before committing.
 This is also enforced by the CI.
 All public items must be documented. We adhere to the [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/about.html) with respect to documentation.
 

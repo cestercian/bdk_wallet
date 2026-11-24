@@ -76,7 +76,7 @@ use crate::wallet::{
     error::{BuildFeeBumpError, CreateTxError, MiniscriptPsbtError},
     signer::{SignOptions, SignerError, SignerOrdering, SignersContainer, TransactionSigner},
     tx_builder::{FeePolicy, TxBuilder, TxParams},
-    utils::{After, Older, SecpCtx, check_nsequence_rbf},
+    utils::{SecpCtx, check_nsequence_rbf},
 };
 // Unstable bdk-tx imports — only active with --cfg bdk_wallet_unstable and feature = "bdk-tx".
 #[cfg(all(bdk_wallet_unstable, feature = "bdk-tx", feature = "std"))]
@@ -749,7 +749,9 @@ impl Wallet {
     ///
     /// Returns whether the given index was present and then removed from the unused set.
     pub fn mark_used(&mut self, keychain: KeychainKind, index: u32) -> bool {
-        self.tx_graph.index.mark_used(keychain, index)
+        self.tx_graph
+            .index
+            .mark_used(self.map_keychain(keychain), index)
     }
 
     /// Undoes the effect of [`mark_used`] and returns whether the `index` was inserted
@@ -761,7 +763,9 @@ impl Wallet {
     ///
     /// [`mark_used`]: Self::mark_used
     pub fn unmark_used(&mut self, keychain: KeychainKind, index: u32) -> bool {
-        self.tx_graph.index.unmark_used(keychain, index)
+        self.tx_graph
+            .index
+            .unmark_used(self.map_keychain(keychain), index)
     }
 
     /// List addresses that are revealed but unused.
@@ -945,8 +949,9 @@ impl Wallet {
     /// Calculates the fee of a given transaction. Returns [`Amount::ZERO`] if `tx` is a coinbase
     /// transaction.
     ///
-    /// To calculate the fee for a [`Transaction`] with inputs not owned by this wallet you must
-    /// manually insert the TxOut(s) into the tx graph using the [`insert_txout`] function.
+    /// To calculate the fee for a [`Transaction`] with inputs not owned by this wallet, register
+    /// any missing prevouts with [`insert_txout`] or their full parent transactions with
+    /// [`apply_update`](Self::apply_update).
     ///
     /// Note `tx` does not have to be in the graph for this to work.
     ///
@@ -976,8 +981,8 @@ impl Wallet {
 
     /// Calculate the [`FeeRate`] for a given transaction.
     ///
-    /// To calculate the fee rate for a [`Transaction`] with inputs not owned by this wallet you
-    /// must manually insert the TxOut(s) into the tx graph using the [`insert_txout`] function.
+    /// To calculate the fee rate for a [`Transaction`] with inputs not owned by this wallet,
+    /// register any missing prevouts as described in [`calculate_fee`](Self::calculate_fee).
     ///
     /// Note `tx` does not have to be in the graph for this to work.
     ///
@@ -1000,7 +1005,6 @@ impl Wallet {
     /// let tx = &psbt.clone().extract_tx().expect("tx");
     /// let fee_rate = wallet.calculate_fee_rate(tx).expect("fee rate");
     /// ```
-    /// [`insert_txout`]: Self::insert_txout
     pub fn calculate_fee_rate(&self, tx: &Transaction) -> Result<FeeRate, CalculateFeeError> {
         self.calculate_fee(tx).map(|fee| fee / tx.weight())
     }
@@ -1505,6 +1509,12 @@ impl Wallet {
             }
         };
 
+        let satisfaction_by_outpoint: HashMap<OutPoint, InputSatisfaction> = required_utxos
+            .iter()
+            .chain(optional_utxos.iter())
+            .map(|weighted| (weighted.utxo.outpoint(), self.input_satisfaction(weighted)))
+            .collect();
+
         // Get drain script.
         let mut drain_index = Option::<(KeychainKind, u32)>::None;
         let drain_script = match params.drain_to {
@@ -1599,6 +1609,18 @@ impl Wallet {
         // Sort inputs/outputs according to the chosen algorithm.
         params.ordering.sort_tx_with_aux_rand(&mut tx, rng);
 
+        // Reject transactions that would exceed the standardness weight limit once signed.
+        // `tx.weight()` is the unsigned weight (empty witnesses). Each input contributes the
+        // satisfaction weight tracked on its selection candidate, including foreign UTXOs.
+        let satisfactions = tx.input.iter().map(|txin| {
+            satisfaction_by_outpoint
+                .get(&txin.previous_output)
+                .copied()
+                .unwrap_or_else(|| self.satisfaction_for_outpoint(txin.previous_output))
+        });
+        check_max_standard_tx_weight(&tx, satisfactions)
+            .map_err(|(weight, limit)| CreateTxError::TxWeightLimitExceeded { weight, limit })?;
+
         let psbt = self.complete_transaction(tx, coin_selection.selected, params)?;
 
         // Recording changes to the change keychain.
@@ -1620,10 +1642,25 @@ impl Wallet {
     /// *replace by fee* (RBF). If the transaction can be fee bumped then it returns a [`TxBuilder`]
     /// pre-populated with the inputs and outputs of the original transaction.
     ///
-    /// ## Example
+    /// # Foreign inputs
     ///
-    /// ```no_run
-    /// # // TODO: remove norun -- bumping fee seems to need the tx in the wallet database first.
+    /// This method reconstructs foreign PSBT inputs from the wallet's transaction graph. Data
+    /// passed to [`TxBuilder::add_foreign_utxo`](tx_builder::TxBuilder::add_foreign_utxo) when
+    /// building the original transaction is not stored in that graph automatically.
+    /// Before calling this method, register each foreign output with [`Self::insert_txout`] or
+    /// its full parent transaction with [`Self::apply_update`]:
+    ///
+    /// - Legacy and P2SH inputs require the full parent transaction. With only the output
+    ///   registered, this method returns [`BuildFeeBumpError::TransactionNotFound`].
+    /// - Native segwit inputs, including Taproot, need only the output to construct the builder.
+    ///   However, for non-Taproot inputs, [`TxBuilder::finish`](tx_builder::TxBuilder::finish)
+    ///   returns [`CreateTxError::MissingNonWitnessUtxo`] unless the full parent was also
+    ///   registered or [`TxBuilder::only_witness_utxo`](tx_builder::TxBuilder::only_witness_utxo)
+    ///   is set on the returned builder.
+    ///
+    /// # Example
+    ///
+    /// ```
     /// # use std::str::FromStr;
     /// # use bitcoin::*;
     /// # use bdk_wallet::*;
@@ -1647,6 +1684,7 @@ impl Wallet {
     /// psbt.sign(&signer, wallet.secp_ctx()).map_err(|(_, e)| Error::msg(format!("{e:?}")))?;
     /// wallet.finalize_psbt(&mut psbt, SignOptions::default())?;
     /// let tx = psbt.clone().extract_tx().expect("tx");
+    /// # bdk_wallet::test_utils::insert_tx(&mut wallet, tx.clone());
     /// // broadcast tx but it's taking too long to confirm so we want to bump the fee
     /// let mut psbt =  {
     ///     let mut builder = wallet.build_fee_bump(tx.compute_txid())?;
@@ -1735,25 +1773,32 @@ impl Wallet {
                             }),
                         })
                     }
-                    None => Ok(WeightedUtxo {
-                        satisfaction_weight: Weight::from_wu_usize(
-                            serialize(&txin.script_sig).len() * 4 + serialize(&txin.witness).len(),
-                        ),
-                        utxo: Utxo::Foreign {
-                            outpoint,
-                            sequence: txin.sequence,
-                            psbt_input: Box::new(psbt::Input {
-                                witness_utxo: prev_txout
-                                    .script_pubkey
-                                    .witness_version()
-                                    .map(|_| prev_txout),
-                                non_witness_utxo: tx_graph
-                                    .get_tx(outpoint.txid)
-                                    .map(|tx| tx.as_ref().clone()),
-                                ..Default::default()
-                            }),
-                        },
-                    }),
+                    None => {
+                        let witness_utxo = prev_txout
+                            .script_pubkey
+                            .witness_version()
+                            .map(|_| prev_txout);
+                        let non_witness_utxo =
+                            tx_graph.get_tx(outpoint.txid).map(|tx| tx.as_ref().clone());
+                        if witness_utxo.is_none() && non_witness_utxo.is_none() {
+                            return Err(BuildFeeBumpError::TransactionNotFound(outpoint.txid));
+                        }
+                        Ok(WeightedUtxo {
+                            satisfaction_weight: Weight::from_wu_usize(
+                                serialize(&txin.script_sig).len() * 4
+                                    + serialize(&txin.witness).len(),
+                            ),
+                            utxo: Utxo::Foreign {
+                                outpoint,
+                                sequence: txin.sequence,
+                                psbt_input: Box::new(psbt::Input {
+                                    witness_utxo,
+                                    non_witness_utxo,
+                                    ..Default::default()
+                                }),
+                            },
+                        })
+                    }
                 }
             })
             .collect::<Result<_, _>>()?;
@@ -1892,20 +1937,17 @@ impl Wallet {
         self.update_psbt_with_descriptor(psbt)
             .map_err(SignerError::MiniscriptPsbt)?;
 
+        // Taproot signatures without ANYONECANPAY commit to all input amounts (BIP341).
+        // Otherwise, verify every input amount before signing.
         if !sign_options.trust_witness_utxo {
             let inputs = psbt.inputs.iter().zip(psbt.unsigned_tx.input.iter());
-            let all_taproot = inputs
-                .clone()
-                .all(|(input, txin)| self.is_verified_taproot_input(input, txin.previous_output));
-
-            if !all_taproot {
+            let all_amounts_committed = inputs.clone().all(|(input, txin)| {
+                input.sighash_type.is_none_or(|t| t.to_u32() & 0x80 == 0) // ANYONECANPAY flag
+                    && self.is_verified_taproot_input(input, txin.previous_output)
+            });
+            if !all_amounts_committed {
                 for (input, txin) in inputs {
-                    if input.non_witness_utxo.is_none() {
-                        return Err(SignerError::MissingNonWitnessUtxo);
-                    }
-                    if validated_non_witness_prevout(input, txin.previous_output).is_none() {
-                        return Err(SignerError::InvalidNonWitnessUtxo);
-                    }
+                    self.check_input_amount(input, txin.previous_output)?;
                 }
             }
         }
@@ -1933,6 +1975,46 @@ impl Wallet {
         } else {
             Ok(false)
         }
+    }
+
+    /// Check this input's amount against its parent transaction.
+    ///
+    /// Validate `non_witness_utxo` if supplied. Otherwise, Taproot inputs may use the full parent
+    /// transaction stored in the wallet. Any supplied `witness_utxo` must match the parent's
+    /// output. Non-Taproot inputs require `non_witness_utxo`.
+    fn check_input_amount(
+        &self,
+        input: &psbt::Input,
+        outpoint: OutPoint,
+    ) -> Result<(), SignerError> {
+        if input.non_witness_utxo.is_some() {
+            let prevout = validated_non_witness_prevout(input, outpoint)
+                .ok_or(SignerError::InvalidNonWitnessUtxo)?;
+            if input
+                .witness_utxo
+                .as_ref()
+                .is_some_and(|witness| witness != prevout)
+            {
+                // Ideally InvalidWitnessUtxo; reuse this error for API compatibility.
+                return Err(SignerError::InvalidNonWitnessUtxo);
+            }
+            return Ok(());
+        }
+
+        // Without non_witness_utxo, verify Taproot inputs using the parent stored in the wallet.
+        if let Some(prev_tx) = self.tx_graph.graph().get_tx(outpoint.txid) {
+            if let Some(prevout) = prev_tx
+                .output
+                .get(outpoint.vout as usize)
+                .filter(|prevout| prevout.script_pubkey.is_p2tr())
+            {
+                return match input.witness_utxo.as_ref() {
+                    Some(witness) if witness != prevout => Err(SignerError::InvalidNonWitnessUtxo),
+                    _ => Ok(()),
+                };
+            }
+        }
+        Err(SignerError::MissingNonWitnessUtxo)
     }
 
     /// Whether this outpoint is a verified p2tr.
@@ -1992,52 +2074,14 @@ impl Wallet {
     ///
     /// Returns `true` if the PSBT could be finalized, and `false` otherwise.
     ///
-    /// The [`SignOptions`] can be used to tweak the behavior of the finalizer.
+    /// Timelocks are checked against the PSBT's `nLockTime` and `nSequence`. The [`SignOptions`]
+    /// are currently unused.
     pub fn finalize_psbt(
         &self,
         psbt: &mut Psbt,
-        sign_options: SignOptions,
+        _sign_options: SignOptions,
     ) -> Result<bool, SignerError> {
-        let tx = &psbt.unsigned_tx;
-        let chain_tip = self.chain.tip().block_id();
-        let prev_txids = tx
-            .input
-            .iter()
-            .map(|txin| txin.previous_output.txid)
-            .collect::<HashSet<Txid>>();
-        let confirmation_heights = self
-            .tx_graph
-            .graph()
-            .list_canonical_txs(&self.chain, chain_tip, CanonicalizationParams::default())
-            .filter(|canon_tx| prev_txids.contains(&canon_tx.tx_node.txid))
-            // This is for a small performance gain. Although `.filter` filters out excess txs, it
-            // will still consume the internal `CanonicalIter` entirely. Having a `.take` here
-            // allows us to stop further unnecessary canonicalization.
-            .take(prev_txids.len())
-            .map(|canon_tx| {
-                let txid = canon_tx.tx_node.txid;
-                match canon_tx.chain_position {
-                    ChainPosition::Confirmed { anchor, .. } => (txid, anchor.block_id.height),
-                    ChainPosition::Unconfirmed { .. } => (txid, u32::MAX),
-                }
-            })
-            .collect::<HashMap<Txid, u32>>();
-        let current_height = sign_options
-            .assume_height
-            .unwrap_or_else(|| self.chain.tip().height());
-
-        Ok(self
-            .try_finalize_psbt_with(
-                psbt,
-                Some(current_height),
-                |_, input| {
-                    confirmation_heights
-                        .get(&input.previous_output.txid)
-                        .copied()
-                },
-                true,
-            )?
-            .is_finalized())
+        Ok(self.try_finalize_psbt_with(psbt, true)?.is_finalized())
     }
 
     /// Attempt to finalize each input of a PSBT and return per-input finalization results.
@@ -2055,19 +2099,14 @@ impl Wallet {
         &self,
         psbt: &mut Psbt,
     ) -> Result<FinalizePsbtOutcome, IndexOutOfBoundsError> {
-        self.try_finalize_psbt_with(psbt, None, |_, _| None, false)
+        self.try_finalize_psbt_with(psbt, false)
     }
 
-    fn try_finalize_psbt_with<F>(
+    fn try_finalize_psbt_with(
         &self,
         psbt: &mut Psbt,
-        current_height: Option<u32>,
-        mut confirmation_height_for_input: F,
         clear_output_derivations: bool,
-    ) -> Result<FinalizePsbtOutcome, IndexOutOfBoundsError>
-    where
-        F: FnMut(usize, &bitcoin::TxIn) -> Option<u32>,
-    {
+    ) -> Result<FinalizePsbtOutcome, IndexOutOfBoundsError> {
         let tx = &psbt.unsigned_tx;
         if psbt.inputs.len() < tx.input.len() {
             return Err(IndexOutOfBoundsError::new(
@@ -2078,7 +2117,7 @@ impl Wallet {
 
         let mut outcomes = BTreeMap::new();
 
-        for (n, input) in tx.input.iter().enumerate() {
+        for n in 0..tx.input.len() {
             let psbt_input = &psbt
                 .inputs
                 .get(n)
@@ -2106,19 +2145,8 @@ impl Wallet {
             match desc {
                 Some(desc) => {
                     let mut tmp_input = bitcoin::TxIn::default();
-                    let satisfy_result = if let Some(current_height) = current_height {
-                        let confirmation_height = confirmation_height_for_input(n, input);
-                        desc.satisfy(
-                            &mut tmp_input,
-                            (
-                                PsbtInputSatisfier::new(psbt, n),
-                                After::new(Some(current_height), false),
-                                Older::new(Some(current_height), confirmation_height, false),
-                            ),
-                        )
-                    } else {
-                        desc.satisfy(&mut tmp_input, PsbtInputSatisfier::new(psbt, n))
-                    };
+                    let satisfy_result =
+                        desc.satisfy(&mut tmp_input, PsbtInputSatisfier::new(psbt, n));
 
                     match satisfy_result {
                         Ok(_) => {
@@ -2944,6 +2972,171 @@ impl Wallet {
             })
             .collect()
     }
+
+    /// Satisfaction of a coin-selection candidate, including foreign UTXOs.
+    ///
+    /// Local inputs use the descriptor's [`max_weight_to_satisfy`]. Foreign inputs use the weight
+    /// supplied with the UTXO. Segwit (native or nested) is recorded separately so the standardness
+    /// check can apply BIP 141 witness overhead.
+    ///
+    /// [`max_weight_to_satisfy`]: miniscript::Descriptor::max_weight_to_satisfy
+    fn input_satisfaction(&self, weighted: &WeightedUtxo) -> InputSatisfaction {
+        let segwit = match &weighted.utxo {
+            Utxo::Local(local) => self.descriptor_spends_with_witness(local.keychain),
+            Utxo::Foreign { psbt_input, .. } => spends_with_witness(
+                weighted.utxo.txout().script_pubkey.as_script(),
+                Some(psbt_input),
+            ),
+        };
+        InputSatisfaction {
+            weight: weighted.satisfaction_weight,
+            segwit,
+        }
+    }
+
+    /// Fallback satisfaction when an outpoint was not part of coin selection.
+    ///
+    /// Local wallet UTXOs use the descriptor's [`max_weight_to_satisfy`]. Unknown outpoints
+    /// contribute nothing.
+    ///
+    /// [`max_weight_to_satisfy`]: miniscript::Descriptor::max_weight_to_satisfy
+    fn satisfaction_for_outpoint(&self, outpoint: OutPoint) -> InputSatisfaction {
+        let Some(utxo) = self.get_utxo(outpoint) else {
+            return InputSatisfaction {
+                weight: Weight::ZERO,
+                segwit: false,
+            };
+        };
+        let weight = self
+            .public_descriptor(utxo.keychain)
+            .max_weight_to_satisfy()
+            .unwrap_or(Weight::ZERO);
+        InputSatisfaction {
+            weight,
+            segwit: self.descriptor_spends_with_witness(utxo.keychain),
+        }
+    }
+
+    /// Whether spends of this keychain serialize a witness (native or nested segwit, or taproot).
+    fn descriptor_spends_with_witness(&self, keychain: KeychainKind) -> bool {
+        let desc = self.public_descriptor(keychain);
+        desc.is_witness() || desc.is_taproot()
+    }
+}
+
+/// Extra weight of satisfying one input, and whether that satisfaction is a witness.
+///
+/// `weight` is the miniscript [`max_weight_to_satisfy`] delta: the difference between
+/// `TxIn::default().segwit_weight()` and the satisfied input. That delta does not include the
+/// 1-WU empty witness stack length already assumed by `segwit_weight`.
+///
+/// [`max_weight_to_satisfy`]: miniscript::Descriptor::max_weight_to_satisfy
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InputSatisfaction {
+    weight: Weight,
+    /// `true` when satisfying this input serializes a witness (native segwit, nested segwit, or
+    /// taproot). Pure legacy scriptSig satisfaction is `false`.
+    segwit: bool,
+}
+
+/// Whether satisfying `script_pubkey` serializes a witness.
+///
+/// Native segwit and taproot are witness programs on the prevout. Nested segwit is a P2SH
+/// prevout whose redeem script is itself a witness program. A populated [`psbt::Input::witness_utxo`]
+/// is not evidence: a legacy prevout can carry both `non_witness_utxo` and `witness_utxo`.
+fn spends_with_witness(script_pubkey: &bitcoin::Script, psbt_input: Option<&psbt::Input>) -> bool {
+    if script_pubkey.witness_version().is_some() {
+        return true;
+    }
+    let Some(psbt_input) = psbt_input else {
+        return false;
+    };
+    // Nested segwit only. `witness_utxo` / `witness_script` / `final_script_witness` can be set on
+    // a legacy spend and must not flip this classification.
+    script_pubkey.is_p2sh()
+        && psbt_input
+            .redeem_script
+            .as_ref()
+            .is_some_and(|redeem| redeem.witness_version().is_some())
+}
+
+/// [`bdk_tx::Input`] satisfaction, using the weight already tracked on the selected input.
+///
+/// Planned inputs created from a PSBT do not report [`Input::is_segwit`] unless
+/// `final_script_witness` is set, so witness-ness comes from the prevout and, for nested segwit,
+/// the P2SH redeem script.
+#[cfg(all(bdk_wallet_unstable, feature = "bdk-tx"))]
+fn selection_input_satisfaction(input: &Input) -> InputSatisfaction {
+    let segwit = if input.plan().is_some() {
+        input.is_segwit()
+    } else {
+        spends_with_witness(
+            input.prev_txout().script_pubkey.as_script(),
+            input.psbt_input(),
+        )
+    };
+    InputSatisfaction {
+        weight: Weight::from_wu(input.satisfaction_weight()),
+        segwit,
+    }
+}
+
+/// Signed weight of an unsigned transaction.
+///
+/// `tx.weight()` is the legacy serialization (empty witnesses, no BIP 141 marker). Satisfaction
+/// weights are miniscript deltas from `TxIn::default().segwit_weight()`.
+///
+/// * Pure legacy (no witness satisfaction): overhead is 0. The delta already accounts for the
+///   scriptSig.
+/// * Any witness satisfaction: overhead is 2 WU (marker and flag) plus 1 WU per input. BIP 141
+///   writes a witness stack length for every input, and the miniscript delta assumed that byte
+///   was already present in `segwit_weight`.
+///
+/// Returns [`None`] when the sum overflows `u64`.
+fn estimated_signed_weight(
+    tx: &Transaction,
+    satisfactions: impl IntoIterator<Item = InputSatisfaction>,
+) -> Option<Weight> {
+    let (satisfaction, any_segwit) =
+        satisfactions
+            .into_iter()
+            .try_fold((Weight::ZERO, false), |(acc, any_segwit), sat| {
+                acc.checked_add(sat.weight)
+                    .map(|sum| (sum, any_segwit || sat.segwit))
+            })?;
+
+    let witness_overhead = if any_segwit {
+        // One stack-length byte per input, plus the 2-byte marker/flag.
+        // `usize` fits in `u64` on every supported target.
+        let n_inputs = tx.input.len() as u64;
+        Weight::from_wu(2).checked_add(Weight::from_wu(n_inputs))?
+    } else {
+        Weight::ZERO
+    };
+
+    tx.weight()
+        .checked_add(satisfaction)?
+        .checked_add(witness_overhead)
+}
+
+/// Estimate the signed weight of an assembled unsigned transaction and reject it when it
+/// exceeds [`bitcoin::policy::MAX_STANDARD_TX_WEIGHT`].
+///
+/// On overflow the estimated weight is reported as [`Weight::MAX`], which is above the limit, so
+/// callers surface [`CreateTxError::TxWeightLimitExceeded`] instead of panicking or wrapping.
+fn check_max_standard_tx_weight(
+    tx: &Transaction,
+    satisfactions: impl IntoIterator<Item = InputSatisfaction>,
+) -> Result<(), (Weight, Weight)> {
+    let limit = Weight::from_wu(u64::from(bitcoin::policy::MAX_STANDARD_TX_WEIGHT));
+    let Some(weight) = estimated_signed_weight(tx, satisfactions) else {
+        return Err((Weight::MAX, limit));
+    };
+    if weight > limit {
+        Err((weight, limit))
+    } else {
+        Ok(())
+    }
 }
 
 /// Methods to construct sync/full-scan requests for spk-based chain sources.
@@ -3220,7 +3413,13 @@ impl Wallet {
     /// - A manually selected input is missing from the wallet, or could not be planned
     /// - The input value is insufficient to fund the outputs
     /// - Failure to complete coin selection
+    /// - The assembled transaction exceeds [`bitcoin::policy::MAX_STANDARD_TX_WEIGHT`]
     /// - Failure to create or update the PSBT.
+    ///
+    /// # Coin selection
+    ///
+    /// Unless overridden with [`PsbtParams::coin_selection`], coins are selected with
+    /// [`SelectionStrategy::SingleRandomDraw`].
     ///
     /// # Change address
     ///
@@ -3424,6 +3623,12 @@ impl Wallet {
             )
             .map_err(CreatePsbtError::Psbt)?;
 
+        // Planned and foreign inputs are not in the wallet UTXO set, so their satisfaction
+        // weights live on the selection candidates rather than on a local descriptor.
+        let satisfactions = selection.inputs().iter().map(selection_input_satisfaction);
+        check_max_standard_tx_weight(&psbt.unsigned_tx, satisfactions)
+            .map_err(|(weight, limit)| CreatePsbtError::TxWeightLimitExceeded { weight, limit })?;
+
         // Add global xpubs.
         if params.add_global_xpubs {
             for xpub in self
@@ -3462,6 +3667,12 @@ impl Wallet {
     /// - Failure to calculate the [fee](Wallet::calculate_fee) of an original transaction
     /// - Failure to complete coin selection
     /// - Failure to create or update the PSBT.
+    ///
+    /// # Coin selection
+    ///
+    /// As with [`Wallet::create_psbt`], coins are selected with
+    /// [`SelectionStrategy::SingleRandomDraw`] unless overridden with
+    /// [`PsbtParams::coin_selection`].
     ///
     /// # Change address
     ///
@@ -3630,7 +3841,7 @@ impl Wallet {
             let err = bdk_coin_select::InsufficientFunds {
                 missing: target_amount.to_sat(),
             };
-            return Err(CreatePsbtError::InsufficientFunds(err))?;
+            Err(CreatePsbtError::InsufficientFunds(err))?;
         }
 
         let original_txs: Vec<OriginalTxStats> = direct_conflicts
@@ -4203,5 +4414,152 @@ mod test {
         assert!(deprecated_finalized);
         assert_eq!(deprecated_finalized, signers_finalized);
         assert_eq!(deprecated_psbt, signers_psbt);
+    }
+
+    fn p2pkh_script() -> ScriptBuf {
+        use bitcoin::hashes::Hash;
+        ScriptBuf::new_p2pkh(&bitcoin::PubkeyHash::all_zeros())
+    }
+
+    fn p2wpkh_script() -> ScriptBuf {
+        use bitcoin::hashes::Hash;
+        ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::all_zeros())
+    }
+
+    /// Unsigned tx: `n_inputs` empty inputs and one output. Witnesses are empty, so
+    /// [`Transaction::weight`] is the legacy serialization.
+    fn unsigned_tx(n_inputs: usize, output_script: ScriptBuf) -> Transaction {
+        Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: (0..n_inputs)
+                .map(|_| bitcoin::TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                })
+                .collect(),
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: output_script,
+            }],
+        }
+    }
+
+    fn sat(weight: u64, segwit: bool) -> InputSatisfaction {
+        InputSatisfaction {
+            weight: Weight::from_wu(weight),
+            segwit,
+        }
+    }
+
+    #[test]
+    fn spends_with_witness_uses_prevout_and_redeem_script() {
+        // Native witness program, with or without PSBT metadata.
+        assert!(spends_with_witness(p2wpkh_script().as_script(), None));
+
+        // Legacy P2PKH that carries both UTXO fields is still a legacy spend. Presence of
+        // witness_utxo used to classify this as segwit.
+        let legacy_spk = p2pkh_script();
+        let prev_tx = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: legacy_spk.clone(),
+            }],
+        };
+        let mut final_witness = Witness::new();
+        final_witness.push([0u8; 72]);
+        final_witness.push([0u8; 33]);
+        let legacy_input = psbt::Input {
+            witness_utxo: Some(prev_tx.output[0].clone()),
+            non_witness_utxo: Some(prev_tx),
+            witness_script: Some(p2wpkh_script()),
+            final_script_witness: Some(final_witness),
+            ..Default::default()
+        };
+        assert!(!spends_with_witness(
+            legacy_spk.as_script(),
+            Some(&legacy_input)
+        ));
+
+        // Nested segwit: P2SH prevout whose redeem script is a witness program.
+        let redeem = p2wpkh_script();
+        let nested_spk = ScriptBuf::new_p2sh(&redeem.script_hash());
+        let nested_input = psbt::Input {
+            redeem_script: Some(redeem),
+            witness_utxo: Some(TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: nested_spk.clone(),
+            }),
+            ..Default::default()
+        };
+        assert!(spends_with_witness(
+            nested_spk.as_script(),
+            Some(&nested_input)
+        ));
+
+        // P2SH wrapping a legacy redeem script does not serialize a witness.
+        let legacy_redeem = p2pkh_script();
+        let legacy_p2sh = ScriptBuf::new_p2sh(&legacy_redeem.script_hash());
+        let legacy_p2sh_input = psbt::Input {
+            redeem_script: Some(legacy_redeem),
+            witness_utxo: Some(TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: legacy_p2sh.clone(),
+            }),
+            ..Default::default()
+        };
+        assert!(!spends_with_witness(
+            legacy_p2sh.as_script(),
+            Some(&legacy_p2sh_input)
+        ));
+    }
+
+    #[test]
+    fn signed_weight_matches_bip141_overhead() {
+        // Review table: pure legacy must not add the segwit marker. P2PKH satisfaction is the
+        // scriptSig delta (428 WU); actual signed weight is unsigned + 428.
+        let legacy = unsigned_tx(1, p2pkh_script());
+        assert_eq!(legacy.weight(), Weight::from_wu(340));
+        assert_eq!(
+            estimated_signed_weight(&legacy, [sat(428, false)]).unwrap(),
+            Weight::from_wu(768)
+        );
+
+        // Mixed: 1 P2WPKH (107 WU) + 2 P2PKH (428 WU). Overhead is 2 + K, K = 3.
+        let mixed = unsigned_tx(3, p2wpkh_script());
+        assert_eq!(mixed.weight(), Weight::from_wu(656));
+        assert_eq!(
+            estimated_signed_weight(&mixed, [sat(107, true), sat(428, false), sat(428, false)])
+                .unwrap(),
+            Weight::from_wu(1_624)
+        );
+
+        // Pure P2WPKH, K = 100. Overhead is 2 + 100; satisfaction is 107 WU each.
+        let segwit = unsigned_tx(100, p2wpkh_script());
+        assert_eq!(segwit.weight(), Weight::from_wu(16_564));
+        let satisfactions = (0..100).map(|_| sat(107, true));
+        assert_eq!(
+            estimated_signed_weight(&segwit, satisfactions).unwrap(),
+            Weight::from_wu(27_366)
+        );
+    }
+
+    #[test]
+    fn signed_weight_overflow_is_tx_weight_limit_exceeded() {
+        let tx = unsigned_tx(1, p2wpkh_script());
+        let limit = Weight::from_wu(u64::from(bitcoin::policy::MAX_STANDARD_TX_WEIGHT));
+        // Summing the satisfaction itself overflows, before the base tx weight is added.
+        let overflow =
+            check_max_standard_tx_weight(&tx, [sat(u64::MAX - 10, false), sat(100, false)]);
+        assert_eq!(overflow, Err((Weight::MAX, limit)));
+
+        // A single astronomical satisfaction plus the unsigned tx weight overflows.
+        let astronomical = check_max_standard_tx_weight(&tx, [sat(u64::MAX - 200, true)]);
+        assert_eq!(astronomical, Err((Weight::MAX, limit)));
     }
 }

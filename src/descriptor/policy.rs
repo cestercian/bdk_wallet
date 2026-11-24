@@ -64,7 +64,7 @@ use crate::descriptor::ExtractPolicy;
 use crate::keys::ExtScriptContext;
 use crate::types::IndexOutOfBoundsError;
 use crate::wallet::signer::{SignerId, SignersContainer};
-use crate::wallet::utils::{After, Older, SecpCtx};
+use crate::wallet::utils::SecpCtx;
 
 use super::XKeyUtils;
 use super::checksum::calc_checksum;
@@ -704,7 +704,7 @@ impl Policy {
                 // make sure all the indexes in the `selected` list are within range
                 for index in &selected {
                     if *index >= items.len() {
-                        return Err(IndexOutOfBoundsError::new(*index, items.len()))?;
+                        Err(IndexOutOfBoundsError::new(*index, items.len()))?;
                     }
                 }
 
@@ -727,7 +727,7 @@ impl Policy {
                     return Err(PolicyError::NotEnoughItemsSelected(self.id.clone()));
                 }
                 if let Some(item) = selected.into_iter().find(|&i| i >= keys.len()) {
-                    return Err(IndexOutOfBoundsError::new(item, keys.len()))?;
+                    Err(IndexOutOfBoundsError::new(item, keys.len()))?;
                 }
 
                 Ok(Condition::default())
@@ -950,9 +950,8 @@ impl<Ctx: ScriptContext + 'static> ExtractPolicy for Miniscript<DescriptorPublic
                     ..
                 } = build_sat
                 {
-                    let after = After::new(Some(current_height), false);
-                    let after_sat =
-                        Satisfier::<bitcoin::PublicKey>::check_after(&after, (*value).into());
+                    let after_sat = absolute::LockTime::from_height(current_height)
+                        .is_ok_and(|tip| absolute::LockTime::from(*value).is_implied_by(tip));
                     let inputs_sat = psbt_inputs_sat(psbt).all(|sat| {
                         Satisfier::<bitcoin::PublicKey>::check_after(&sat, (*value).into())
                     });
@@ -980,9 +979,11 @@ impl<Ctx: ScriptContext + 'static> ExtractPolicy for Miniscript<DescriptorPublic
                     psbt,
                 } = build_sat
                 {
-                    let older = Older::new(Some(current_height), Some(input_max_height), false);
-                    let older_sat =
-                        Satisfier::<bitcoin::PublicKey>::check_older(&older, (*value).into());
+                    let elapsed = current_height.saturating_sub(input_max_height);
+                    let older_sat = match relative::LockTime::from(*value) {
+                        relative::LockTime::Blocks(n) => elapsed >= u32::from(n.value()),
+                        relative::LockTime::Time(_) => false,
+                    };
                     let inputs_sat = psbt_inputs_sat(psbt).all(|sat| {
                         Satisfier::<bitcoin::PublicKey>::check_older(&sat, (*value).into())
                     });
@@ -1474,10 +1475,9 @@ mod test {
         let locktime_threshold = 500000000; // if less than this means block number, else block time in seconds
         let locktime_blocks = 100;
         let locktime_seconds = locktime_blocks + locktime_threshold;
-        let desc = descriptor!(sh(and_v(
-            v: pk(prvkey0),
-            and_v(v: after(locktime_seconds), after(locktime_blocks))
-        )))
+        let desc = descriptor!(
+            sh(and_v(v: pk(prvkey0), and_v(v: after(locktime_seconds), after(locktime_blocks))))
+        )
         .unwrap();
         let (wallet_desc, keymap) = desc
             .into_wallet_descriptor(&secp, NetworkKind::Test)
@@ -1501,6 +1501,7 @@ mod test {
         let (prvkey0, _pubkey0, _fingerprint0) = setup_keys(TPRV0_STR, PATH, &secp);
         let locktime_blocks_100 = 100;
         let locktime_blocks_200 = 200;
+        #[rustfmt::skip]
         let desc = descriptor!(sh(and_v(
             v: pk(prvkey0),
             and_v(v: after(locktime_blocks_100), after(locktime_blocks_200))
@@ -1527,6 +1528,7 @@ mod test {
         let locktime_seconds_offset = 500000000;
         let locktime_seconds_100 = locktime_seconds_offset + 100;
         let locktime_seconds_200 = locktime_seconds_offset + 200;
+        #[rustfmt::skip]
         let desc = descriptor!(sh(and_v(
             v: pk(prvkey1),
             and_v(v: after(locktime_seconds_100), after(locktime_seconds_200))
@@ -1733,6 +1735,21 @@ mod test {
         );
         //println!("{}", serde_json::to_string(&policy_expired).unwrap());
 
+        // An input height at or above the current height leaves `older` unsatisfied, without
+        // overflowing at the `u32` limit
+        for (current_height, input_max_height) in [(10, 12), (u32::MAX, u32::MAX)] {
+            let build_sat = BuildSatisfaction::PsbtTimelocks {
+                psbt: &psbt,
+                current_height,
+                input_max_height,
+            };
+            let policy = wallet_desc
+                .extract_policy(&signers_container, build_sat, &secp)
+                .unwrap()
+                .unwrap();
+            assert_matches!(&policy.satisfaction, Satisfaction::Partial { items, .. } if items.is_empty());
+        }
+
         let psbt_signed = Psbt::from_str(PSBT_POLICY_CONSIDER_TIMELOCK_EXPIRED_SIGNED).unwrap();
 
         let build_sat_expired_signed = BuildSatisfaction::PsbtTimelocks {
@@ -1760,12 +1777,9 @@ mod test {
         let (prvkey_bob, _, _) = setup_keys(BOB_TPRV_STR, ALICE_BOB_PATH, &secp);
         let (prvkey_carol, _, _) = setup_keys(CAROL_TPRV_STR, ALICE_BOB_PATH, &secp);
 
-        let desc = descriptor!(wsh(c: andor(
-            pk(prvkey_alice),
-            pk_k(prvkey_bob),
-            pk_h(prvkey_carol),
-        )))
-        .unwrap();
+        let desc =
+            descriptor!(wsh(c: andor(pk(prvkey_alice), pk_k(prvkey_bob), pk_h(prvkey_carol))))
+                .unwrap();
 
         let (wallet_desc, keymap) = desc
             .into_wallet_descriptor(&secp, NetworkKind::Test)

@@ -28,10 +28,11 @@ jobs:
       # The 'toolchain' argument on this action overrides the Rust compiler version set in rust-toolchain.toml
       # in order to test our MSRV.
       - name: Install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           toolchain: 1.85 # MSRV
           cache: true
+          rustflags: "-D warnings"
       - name: Pin dependencies for MSRV
         run: ./ci/pin-msrv.sh
       - name: Build (no default features)
@@ -60,9 +61,10 @@ jobs:
       # This action will honor the Rust compiler version set in rust-toolchain.toml. We aim to keep it in sync with
       # Rust stable.
       - name: Install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           cache: true
+          rustflags: "-D warnings"
       - name: Build (no default features)
         run: |
           cargo build --workspace --no-default-features --features miniscript/no-std,bdk_chain/hashbrown
@@ -83,9 +85,10 @@ jobs:
           persist-credentials: false
       # This action automatically reads and applies rust-toolchain.toml
       - name: Install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           cache: true
+          rustflags: "-D warnings"
       - name: Check no-std
         # TODO "--target thumbv6m-none-eabi" should work but currently does not
         run: cargo check --no-default-features --features miniscript/no-std,bdk_chain/hashbrown
@@ -94,23 +97,22 @@ jobs:
     name: Check WASM
     runs-on: ubuntu-latest
     env:
-      CC: clang-14
-      CFLAGS: -I/usr/include
+      # `secp256k1-sys` compiles a bit of C (wasm/wasm.c) for wasm32, so we need a C compiler
+      # that can target wasm32. GCC can't, but clang can — and the ubuntu runner image already
+      # ships clang (>= 16), so no extra packages are needed.
+      CC: clang
     steps:
       - name: Checkout
         uses: actions/checkout@v7
         with:
           persist-credentials: false
-        # Install a recent version of clang that supports wasm32
-      - run: wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add - || exit 1
-      - run: sudo apt-get update || exit 1
-      - run: sudo apt-get install -y libclang-common-14-dev clang-14 libc6-dev-i386 || exit 1
       # This action automatically reads and applies rust-toolchain.toml
       - name: Install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           cache: true
           target: wasm32-unknown-unknown
+          rustflags: "-D warnings"
       - name: Check WASM
         run: |
           rustup target add wasm32-unknown-unknown
@@ -124,13 +126,16 @@ jobs:
         uses: actions/checkout@v7
         with:
           persist-credentials: false
-      # This action automatically reads and applies rust-toolchain.toml
+      # The 'toolchain' argument on this action overrides the Rust compiler version set in rust-toolchain.toml
+      # Pinned nightly for formatting; keep in sync with NIGHTLY in the justfile
       - name: Install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
+          toolchain: nightly-2026-10-27
+          components: rustfmt
           cache: true
       - name: Check fmt
-        run: cargo fmt --all --check
+        run: cargo +nightly-2026-10-27 fmt --all --check
 
   clippy_check:
     name: Rust clippy
@@ -144,9 +149,10 @@ jobs:
           persist-credentials: false
       # This action automatically reads and applies rust-toolchain.toml
       - name: Install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           cache: true
+          rustflags: "-D warnings"
       - name: Clippy
         env:
           RUSTFLAGS: "-D warnings --cfg bdk_wallet_unstable"
@@ -162,9 +168,10 @@ jobs:
           persist-credentials: false
       # This action automatically reads and applies rust-toolchain.toml
       - name: Install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           cache: true
+          rustflags: "-D warnings"
       - name: Check docs
         env: 
           RUSTDOCFLAGS: "-D warnings --cfg bdk_wallet_unstable"
@@ -176,7 +183,7 @@ jobs:
     if: github.event_name == 'pull_request'
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
